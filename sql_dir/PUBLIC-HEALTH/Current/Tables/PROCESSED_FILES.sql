@@ -1,0 +1,60 @@
+-- Create sequence for the ID column
+CREATE SEQUENCE PROCESSED_FILES_SEQ
+    START WITH 1
+    INCREMENT BY 1
+    NOCACHE
+    NOCYCLE;
+
+-- Create the PROCESSED_FILES table
+CREATE TABLE PROCESSED_FILES (
+    ID NUMBER DEFAULT PROCESSED_FILES_SEQ.NEXTVAL PRIMARY KEY,
+    STAGE_NAME VARCHAR2(100) NOT NULL,
+    FILE_NAME VARCHAR2(255) NOT NULL,
+    SOURCE_PATH VARCHAR2(500) NOT NULL,
+    DESTINATION_PATH VARCHAR2(500) NOT NULL,
+    PROCESSED_DATE TIMESTAMP NOT NULL,
+    CREATED_BY VARCHAR2(100) DEFAULT 'system' NOT NULL
+);
+
+-- Create index for faster lookups when checking if a file has been processed
+CREATE UNIQUE INDEX IDX_PROCESSED_FILE_UNIQUE 
+    ON PROCESSED_FILES (STAGE_NAME, FILE_NAME, DESTINATION_PATH);
+
+-- Add comments for documentation
+COMMENT ON TABLE PROCESSED_FILES IS 'Tracks files that have been processed in stages with single-copy guarantee';
+COMMENT ON COLUMN PROCESSED_FILES.ID IS 'Primary key';
+COMMENT ON COLUMN PROCESSED_FILES.STAGE_NAME IS 'Name of the processing stage';
+COMMENT ON COLUMN PROCESSED_FILES.FILE_NAME IS 'Name of the processed file';
+COMMENT ON COLUMN PROCESSED_FILES.SOURCE_PATH IS 'Source path of the file';
+COMMENT ON COLUMN PROCESSED_FILES.DESTINATION_PATH IS 'Destination path where the file was copied';
+COMMENT ON COLUMN PROCESSED_FILES.PROCESSED_DATE IS 'Date and time when the file was processed';
+COMMENT ON COLUMN PROCESSED_FILES.CREATED_BY IS 'User or system that processed the file';
+
+-- Create a view for easier querying of processed files with additional information
+CREATE OR REPLACE VIEW V_PROCESSED_FILES AS
+SELECT 
+    PF.ID,
+    PF.STAGE_NAME,
+    PF.FILE_NAME,
+    PF.SOURCE_PATH,
+    PF.DESTINATION_PATH,
+    PF.PROCESSED_DATE,
+    PF.CREATED_BY,
+    EXTRACT(DAY FROM (SYSTIMESTAMP - PF.PROCESSED_DATE)) * 24 + 
+    EXTRACT(HOUR FROM (SYSTIMESTAMP - PF.PROCESSED_DATE)) AS HOURS_SINCE_PROCESSED
+FROM 
+    PROCESSED_FILES PF;
+
+-- Grant permissions (adjust as needed for your environment)
+GRANT SELECT, INSERT, UPDATE, DELETE ON PROCESSED_FILES TO STATERPT_USER;
+GRANT SELECT ON V_PROCESSED_FILES TO STATERPT_USER;
+GRANT SELECT, ALTER ON PROCESSED_FILES_SEQ TO STATERPT_USER;
+
+select * from PROCESSED_FILES
+where regexp_like(destination_path , '10\.16\.199\.53')
+--and regexp_like(file_name,'20250806');
+--where regexp_like(file_name,'IL');
+and processed_date > '10-AUG-25';
+
+--delete processed_files
+where file_name = 'CA.HL7.20250806000436.hl7';

@@ -1,0 +1,450 @@
+-- ========================================================================
+-- MULTI-STATE VALIDATION TEST FOR CONDITION_PROCESSOR PACKAGE
+-- ========================================================================
+-- This test validates results across all active states using the initialized
+-- GTT_RESULTS_EXTRACT table, similar to the single state test but iterating
+-- through all configured states
+-- ========================================================================
+
+-- Test 6.2: Validate results for ALL active states (limited records per state)
+-- Enhanced with asr_process_run MERGE operations
+DECLARE
+    v_states_cursor SYS_REFCURSOR;
+    v_results_cursor SYS_REFCURSOR;
+    v_record STATERPT_OWNER.GTT_RESULTS_EXTRACT%ROWTYPE;
+    
+    v_state_abbrev VARCHAR2(2);
+    v_state_name VARCHAR2(100);
+    v_count NUMBER := 0;
+    v_total_count NUMBER := 0;
+    v_state_count NUMBER := 0;
+    v_max_records_per_state NUMBER := 500; -- Limit per state for testing
+    v_process_date DATE := TRUNC(SYSDATE -1);
+    
+    -- Track asr_process_run operations
+    v_inserted_count NUMBER := 0;
+    v_updated_count NUMBER := 0;
+    v_total_inserted NUMBER := 0;
+    v_total_updated NUMBER := 0;
+    
+BEGIN
+    DBMS_OUTPUT.PUT_LINE('=== Testing Results Validation for ALL Active States ===');
+    DBMS_OUTPUT.PUT_LINE('Process Date: ' || TO_CHAR(v_process_date, 'YYYY-MM-DD'));
+    DBMS_OUTPUT.PUT_LINE('Max Records Per State: ' || v_max_records_per_state);
+    DBMS_OUTPUT.PUT_LINE('========================================');
+    
+    -- Ensure session is initialized first
+    IF NOT STATERPT_OWNER.condition_processor.get_session_status() LIKE '%INITIALIZED%' THEN
+        DBMS_OUTPUT.PUT_LINE('Initializing session...');
+        STATERPT_OWNER.condition_processor.initialize_session(SYSDATE - 1);
+    END IF;
+    
+    -- Get all active states
+    v_states_cursor := STATERPT_OWNER.condition_processor.get_active_states();
+    
+    -- Loop through each active state
+    LOOP
+        FETCH v_states_cursor INTO v_state_abbrev, v_state_name;
+        EXIT WHEN v_states_cursor%NOTFOUND;
+        
+        v_state_count := v_state_count + 1;
+        v_count := 0;
+        
+        DBMS_OUTPUT.PUT_LINE('--- State ' || v_state_count || ': ' || v_state_abbrev || ' (' || v_state_name || ') ---');
+        
+        BEGIN
+            -- Get validation results for this state
+            v_results_cursor := STATERPT_OWNER.condition_processor.validate_results(
+                p_state_abbrev => v_state_abbrev,
+                p_process_date => v_process_date,
+                p_max_records => v_max_records_per_state,
+                p_result_status_filter => 'F'
+            );
+            
+            -- Process results for this state
+            v_inserted_count := 0;
+            v_updated_count := 0;
+            
+            LOOP
+                FETCH v_results_cursor INTO v_record;
+                EXIT WHEN v_results_cursor%NOTFOUND;
+                
+                v_count := v_count + 1;
+                
+                -- Show first 5 records per state for visibility
+                IF v_count <= 5 THEN
+                    DBMS_OUTPUT.PUT_LINE('  Record ' || v_count || ': Order=' || v_record.order_number || 
+                                       ', Test=' || v_record.result_test_code || 
+                                       ', Patient=' || v_record.patient_last_name ||
+                                       ', Facility=' || v_record.facility_name);
+                END IF;
+                
+                -- MERGE statement to insert/update asr_process_run
+                MERGE INTO asr_process_run target
+                USING (
+                    SELECT 
+                        v_record.order_number as order_number,
+                        v_record.order_test_code as order_test_code,
+                        v_record.result_test_code as result_test_code,
+                        v_record.performing_lab_id as performing_lab_id,
+                        v_record.textual_result_full as textual_result_full,
+                        v_record.patient_last_name as patient_last_name,
+                        v_state_abbrev as source,
+                        TO_CHAR(v_process_date, 'DD-MON-YY') as activitydate,
+                        'N' as complete
+                    FROM DUAL
+                ) source ON (
+                    target.order_number = source.order_number 
+                    AND target.result_test_code = source.result_test_code
+                    AND target.source = source.source
+                )
+                WHEN NOT MATCHED THEN
+                    INSERT (
+                        order_number,
+                        order_test_code,
+                        result_test_code,
+                        performing_lab_id,
+                        textual_result_full,
+                        patient_last_name,
+                        source,
+                        activitydate,
+                        complete
+                    ) VALUES (
+                        source.order_number,
+                        source.order_test_code,
+                        source.result_test_code,
+                        source.performing_lab_id,
+                        source.textual_result_full,
+                        source.patient_last_name,
+                        source.source,
+                        source.activitydate,
+                        source.complete
+                    )
+                WHEN MATCHED THEN
+                    UPDATE SET
+                        order_test_code = source.order_test_code,
+                        performing_lab_id = source.performing_lab_id,
+                        textual_result_full = source.textual_result_full,
+                        patient_last_name = source.patient_last_name,
+                        activitydate = source.activitydate,
+                        complete = source.complete;
+                
+                -- Track insert vs update operations
+                IF SQL%ROWCOUNT > 0 THEN
+                    -- Check if it was an insert or update by looking at the merge operation
+                    -- Since we can't directly detect insert vs update in MERGE, we'll count total operations
+                    IF v_count = 1 THEN
+                        -- For first record, check if record existed before
+                        DECLARE
+                            v_exists NUMBER;
+                        BEGIN
+                            SELECT COUNT(*) INTO v_exists
+                            FROM asr_process_run
+                            WHERE order_number = v_record.order_number
+                            AND result_test_code = v_record.result_test_code
+                            AND source = v_state_abbrev;
+                            
+                            IF v_exists > 0 THEN
+                                v_updated_count := v_updated_count + 1;
+                            ELSE
+                                v_inserted_count := v_inserted_count + 1;
+                            END IF;
+                        END;
+                    ELSE
+                        -- For subsequent records, assume insert (most common case)
+                        v_inserted_count := v_inserted_count + 1;
+                    END IF;
+                END IF;
+                
+            END LOOP;
+            
+            CLOSE v_results_cursor;
+            
+            v_total_count := v_total_count + v_count;
+            v_total_inserted := v_total_inserted + v_inserted_count;
+            v_total_updated := v_total_updated + v_updated_count;
+            
+            DBMS_OUTPUT.PUT_LINE('  State ' || v_state_abbrev || ' Total: ' || v_count || ' records');
+            DBMS_OUTPUT.PUT_LINE('    ASR_PROCESS_RUN - Inserted: ' || v_inserted_count || ', Updated: ' || v_updated_count);
+            
+        EXCEPTION
+            WHEN OTHERS THEN
+                DBMS_OUTPUT.PUT_LINE('  ERROR processing state ' || v_state_abbrev || ': ' || SQLERRM);
+                IF v_results_cursor%ISOPEN THEN
+                    CLOSE v_results_cursor;
+                END IF;
+        END;
+        
+        -- Add separator for readability
+        IF MOD(v_state_count, 5) = 0 THEN
+            DBMS_OUTPUT.PUT_LINE('----------------------------------------');
+        END IF;
+        
+    END LOOP;
+    
+    CLOSE v_states_cursor;
+    
+    DBMS_OUTPUT.PUT_LINE('========================================');
+    DBMS_OUTPUT.PUT_LINE('MULTI-STATE VALIDATION SUMMARY:');
+    DBMS_OUTPUT.PUT_LINE('Total States Processed: ' || v_state_count);
+    DBMS_OUTPUT.PUT_LINE('Total Records Found: ' || v_total_count);
+    DBMS_OUTPUT.PUT_LINE('Average Records Per State: ' || ROUND(v_total_count / GREATEST(v_state_count, 1), 2));
+    DBMS_OUTPUT.PUT_LINE('');
+    DBMS_OUTPUT.PUT_LINE('ASR_PROCESS_RUN OPERATIONS:');
+    DBMS_OUTPUT.PUT_LINE('Total Records Inserted: ' || v_total_inserted);
+    DBMS_OUTPUT.PUT_LINE('Total Records Updated: ' || v_total_updated);
+    DBMS_OUTPUT.PUT_LINE('Total ASR Operations: ' || (v_total_inserted + v_total_updated));
+    DBMS_OUTPUT.PUT_LINE('');
+    
+    -- Clean up single 310 order test codes after all processing
+    DBMS_OUTPUT.PUT_LINE('Cleaning up invalid 310 records (single results)...');
+    
+    DELETE FROM asr_process_run 
+    WHERE activitydate = TO_CHAR(v_process_date, 'DD-MON-YY')
+    AND order_test_code = '310'
+    AND (order_number, order_test_code) IN (
+        SELECT order_number, order_test_code
+        FROM asr_process_run
+        WHERE activitydate = TO_CHAR(v_process_date, 'DD-MON-YY')
+        AND order_test_code = '310'
+        GROUP BY order_number, order_test_code
+        HAVING COUNT(1) = 1
+    );
+    
+    DBMS_OUTPUT.PUT_LINE('Deleted ' || SQL%ROWCOUNT || ' invalid 310 records (orders with single results)');
+    
+    COMMIT;
+    DBMS_OUTPUT.PUT_LINE('Changes committed to database');
+    DBMS_OUTPUT.PUT_LINE('========================================');
+    
+EXCEPTION
+    WHEN OTHERS THEN
+        DBMS_OUTPUT.PUT_LINE('ERROR in multi-state validation: ' || SQLERRM);
+        IF v_states_cursor%ISOPEN THEN
+            CLOSE v_states_cursor;
+        END IF;
+        IF v_results_cursor%ISOPEN THEN
+            CLOSE v_results_cursor;
+        END IF;
+END;
+/
+-- ========================================================================
+-- Test 6.3: Multi-State Validation with Summary Statistics
+-- ========================================================================
+
+DECLARE
+    v_states_cursor SYS_REFCURSOR;
+    v_results_cursor SYS_REFCURSOR;
+    v_record STATERPT_OWNER.GTT_RESULTS_EXTRACT%ROWTYPE;
+    
+    v_state_abbrev VARCHAR2(2);
+    v_state_name VARCHAR2(100);
+    v_count NUMBER := 0;
+    v_total_count NUMBER := 0;
+    v_state_count NUMBER := 0;
+    v_states_with_data NUMBER := 0;
+    v_max_records_per_state NUMBER := 100;
+    v_process_date DATE := TRUNC(SYSDATE-2);
+    
+    -- Statistics tracking
+    TYPE state_stats_type IS RECORD (
+        state_abbrev VARCHAR2(2),
+        record_count NUMBER
+    );
+    TYPE state_stats_array IS TABLE OF state_stats_type;
+    v_state_stats state_stats_array := state_stats_array();
+    
+BEGIN
+    DBMS_OUTPUT.PUT_LINE('=== Multi-State Validation with Statistics ===');
+    DBMS_OUTPUT.PUT_LINE('Process Date: ' || TO_CHAR(v_process_date, 'YYYY-MM-DD'));
+    
+    -- Ensure session is initialized
+    IF NOT STATERPT_OWNER.condition_processor.get_session_status() LIKE '%INITIALIZED%' THEN
+        STATERPT_OWNER.condition_processor.initialize_session(SYSDATE - 1);
+    END IF;
+    
+    -- Get all active states
+    v_states_cursor := STATERPT_OWNER.condition_processor.get_active_states();
+    
+    -- Process each state
+    LOOP
+        FETCH v_states_cursor INTO v_state_abbrev, v_state_name;
+        EXIT WHEN v_states_cursor%NOTFOUND;
+        
+        v_state_count := v_state_count + 1;
+        v_count := 0;
+        
+        BEGIN
+            v_results_cursor := STATERPT_OWNER.condition_processor.validate_results(
+                p_state_abbrev => v_state_abbrev,
+                p_process_date => v_process_date,
+                p_max_records => v_max_records_per_state,
+                p_result_status_filter => 'F'
+            );
+            
+            -- Count records for this state
+            LOOP
+                FETCH v_results_cursor INTO v_record;
+                EXIT WHEN v_results_cursor%NOTFOUND;
+                v_count := v_count + 1;
+            END LOOP;
+            
+            CLOSE v_results_cursor;
+            
+            -- Track statistics
+            v_state_stats.EXTEND;
+            v_state_stats(v_state_stats.COUNT).state_abbrev := v_state_abbrev;
+            v_state_stats(v_state_stats.COUNT).record_count := v_count;
+            
+            v_total_count := v_total_count + v_count;
+            
+            IF v_count > 0 THEN
+                v_states_with_data := v_states_with_data + 1;
+                DBMS_OUTPUT.PUT_LINE(v_state_abbrev || ': ' || v_count || ' records');
+            END IF;
+            
+        EXCEPTION
+            WHEN OTHERS THEN
+                DBMS_OUTPUT.PUT_LINE(v_state_abbrev || ': ERROR - ' || SQLERRM);
+        END;
+        
+    END LOOP;
+    
+    CLOSE v_states_cursor;
+    
+    -- Display summary statistics
+    DBMS_OUTPUT.PUT_LINE('========================================');
+    DBMS_OUTPUT.PUT_LINE('SUMMARY STATISTICS:');
+    DBMS_OUTPUT.PUT_LINE('Total States Configured: ' || v_state_count);
+    DBMS_OUTPUT.PUT_LINE('States with Data: ' || v_states_with_data);
+    DBMS_OUTPUT.PUT_LINE('States with No Data: ' || (v_state_count - v_states_with_data));
+    DBMS_OUTPUT.PUT_LINE('Total Records: ' || v_total_count);
+    
+    IF v_states_with_data > 0 THEN
+        DBMS_OUTPUT.PUT_LINE('Average Records (States with Data): ' || ROUND(v_total_count / v_states_with_data, 2));
+    END IF;
+    
+    -- Show top 10 states by record count
+    DBMS_OUTPUT.PUT_LINE('========================================');
+    DBMS_OUTPUT.PUT_LINE('TOP STATES BY RECORD COUNT:');
+    
+    FOR i IN 1..LEAST(10, v_state_stats.COUNT) LOOP
+        -- Simple bubble sort for top states (good enough for small dataset)
+        FOR j IN 1..(v_state_stats.COUNT - 1) LOOP
+            IF v_state_stats(j).record_count < v_state_stats(j + 1).record_count THEN
+                DECLARE
+                    temp_state state_stats_type;
+                BEGIN
+                    temp_state := v_state_stats(j);
+                    v_state_stats(j) := v_state_stats(j + 1);
+                    v_state_stats(j + 1) := temp_state;
+                END;
+            END IF;
+        END LOOP;
+    END LOOP;
+    
+    -- Display top states
+    FOR i IN 1..LEAST(10, v_state_stats.COUNT) LOOP
+        IF v_state_stats(i).record_count > 0 THEN
+            DBMS_OUTPUT.PUT_LINE(i || '. ' || v_state_stats(i).state_abbrev || 
+                               ': ' || v_state_stats(i).record_count || ' records');
+        END IF;
+    END LOOP;
+    
+    DBMS_OUTPUT.PUT_LINE('========================================');
+    
+END;
+/
+
+-- ========================================================================
+-- Test 6.4: Multi-State Validation with Test Code Breakdown
+-- ========================================================================
+
+DECLARE
+    v_states_cursor SYS_REFCURSOR;
+    v_results_cursor SYS_REFCURSOR;
+    v_record STATERPT_OWNER.GTT_RESULTS_EXTRACT%ROWTYPE;
+    
+    v_state_abbrev VARCHAR2(2);
+    v_state_name VARCHAR2(100);
+    v_count NUMBER := 0;
+    v_process_date DATE := TRUNC(SYSDATE-2);
+    
+    -- Test code tracking
+    TYPE test_code_count_type IS TABLE OF NUMBER INDEX BY VARCHAR2(10);
+    v_test_codes test_code_count_type;
+    v_test_code VARCHAR2(10);
+    v_total_test_codes NUMBER := 0;
+    
+BEGIN
+    DBMS_OUTPUT.PUT_LINE('=== Multi-State Validation with Test Code Analysis ===');
+    DBMS_OUTPUT.PUT_LINE('Process Date: ' || TO_CHAR(v_process_date, 'YYYY-MM-DD'));
+    
+    -- Ensure session is initialized
+    IF NOT STATERPT_OWNER.condition_processor.get_session_status() LIKE '%INITIALIZED%' THEN
+        STATERPT_OWNER.condition_processor.initialize_session(SYSDATE - 1);
+    END IF;
+    
+    -- Get all active states
+    v_states_cursor := STATERPT_OWNER.condition_processor.get_active_states();
+    
+    -- Process first 5 states for test code analysis
+    v_count := 0;
+    LOOP
+        FETCH v_states_cursor INTO v_state_abbrev, v_state_name;
+        EXIT WHEN v_states_cursor%NOTFOUND OR v_count >= 5;
+        
+        v_count := v_count + 1;
+        DBMS_OUTPUT.PUT_LINE('Analyzing state: ' || v_state_abbrev);
+        
+        BEGIN
+            v_results_cursor := STATERPT_OWNER.condition_processor.validate_results(
+                p_state_abbrev => v_state_abbrev,
+                p_process_date => v_process_date,
+                p_max_records => 50,
+                p_result_status_filter => 'F'
+            );
+            
+            -- Analyze test codes for this state
+            LOOP
+                FETCH v_results_cursor INTO v_record;
+                EXIT WHEN v_results_cursor%NOTFOUND;
+                
+                v_test_code := v_record.result_test_code;
+                
+                IF v_test_codes.EXISTS(v_test_code) THEN
+                    v_test_codes(v_test_code) := v_test_codes(v_test_code) + 1;
+                ELSE
+                    v_test_codes(v_test_code) := 1;
+                END IF;
+                
+            END LOOP;
+            
+            CLOSE v_results_cursor;
+            
+        EXCEPTION
+            WHEN OTHERS THEN
+                DBMS_OUTPUT.PUT_LINE('  ERROR: ' || SQLERRM);
+        END;
+        
+    END LOOP;
+    
+    CLOSE v_states_cursor;
+    
+    -- Display test code summary
+    DBMS_OUTPUT.PUT_LINE('========================================');
+    DBMS_OUTPUT.PUT_LINE('TEST CODE DISTRIBUTION (First 5 States):');
+    
+    v_test_code := v_test_codes.FIRST;
+    WHILE v_test_code IS NOT NULL LOOP
+        DBMS_OUTPUT.PUT_LINE('Test Code ' || v_test_code || ': ' || v_test_codes(v_test_code) || ' records');
+        v_total_test_codes := v_total_test_codes + v_test_codes(v_test_code);
+        v_test_code := v_test_codes.NEXT(v_test_code);
+    END LOOP;
+    
+    DBMS_OUTPUT.PUT_LINE('Total Records Analyzed: ' || v_total_test_codes);
+    DBMS_OUTPUT.PUT_LINE('Unique Test Codes: ' || v_test_codes.COUNT);
+    DBMS_OUTPUT.PUT_LINE('========================================');
+    
+END;
+/
