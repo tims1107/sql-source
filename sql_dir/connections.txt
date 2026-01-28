@@ -1,0 +1,12 @@
+{
+		"type": "sqlserver",
+		"name": "sts_dev",
+		"server": "njvwinfrasql1t",
+		"port": 1433,
+		"username": "cm_owner",
+		"password": "CM3h5fg$Pgq54gfd",
+		"database": "STS",
+		"uri": "jdbc:jtds:sqlserver://njvwinfrasql1t/sts",
+		"driver": "net.sourceforge.jtds.jdbc.Driver",
+		"validquery": "select 1"
+	}
